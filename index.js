@@ -8,14 +8,24 @@ const app = express();
 const PORT = process.env.PORT ?? 8000;
 const LOAN_DAYS = 14;
 
-app.use(cors());
+const corsOptions = {
+  origin: [
+    "https://bookhollow.vercel.app",
+    "http://localhost:3000",
+  ],
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+
+app.use(cors(corsOptions));
 // Cover images may arrive as base64 strings, so raise the 100 kb default.
 app.use(express.json({ limit: "5mb" }));
 
 // ---------- Better Auth JWT verification ----------
 // AUTH_URL = the URL of your Next.js app where Better Auth runs
 // (must match BETTER_AUTH_URL exactly, e.g. http://localhost:3000).
-const AUTH_URL = (process.env.AUTH_URL ?? "http://localhost:3000").replace(/\/$/, "");
+const AUTH_URL = (process.env.AUTH_URL).replace(/\/$/, "");
 // Public keys published by Better Auth's jwt() plugin. jose caches them
 // and re-fetches automatically if the signing key rotates.
 const JWKS = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
