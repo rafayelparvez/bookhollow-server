@@ -5,14 +5,13 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import "dotenv/config";
 
 const app = express();
+app.disable("x-powered-by");
+
 const PORT = process.env.PORT ?? 8000;
 const LOAN_DAYS = 14;
 
 const corsOptions = {
-  origin: [
-    "https://bookhollow.vercel.app",
-    "http://localhost:3000",
-  ],
+  origin: ["https://bookhollow.vercel.app", "http://localhost:3000"],
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
@@ -22,10 +21,18 @@ app.use(cors(corsOptions));
 // Cover images may arrive as base64 strings, so raise the 100 kb default.
 app.use(express.json({ limit: "5mb" }));
 
+// ---------- Env checks (fail early with a clear message) ----------
+if (!process.env.AUTH_URL) {
+  throw new Error("AUTH_URL env variable is required (your Next.js / Better Auth URL).");
+}
+if (!process.env.MONGODB_URI) {
+  throw new Error("MONGODB_URI env variable is required.");
+}
+
 // ---------- Better Auth JWT verification ----------
 // AUTH_URL = the URL of your Next.js app where Better Auth runs
 // (must match BETTER_AUTH_URL exactly, e.g. http://localhost:3000).
-const AUTH_URL = (process.env.AUTH_URL).replace(/\/$/, "");
+const AUTH_URL = process.env.AUTH_URL.replace(/\/$/, "");
 // Public keys published by Better Auth's jwt() plugin. jose caches them
 // and re-fetches automatically if the signing key rotates.
 const JWKS = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
@@ -49,7 +56,41 @@ const isHttpUrl = (value) => {
 const isImageDataUrl = (value) =>
   /^data:image\/(png|jpe?g|webp|gif);base64,/.test(value);
 
-const httpError = (status, message) => Object.assign(new Error(message), { status });
+// Strict 24-char hex check. ObjectId.isValid also accepts any 12-char string.
+const isObjectId = (value) =>
+  typeof value === "string" && /^[a-f\d]{24}$/i.test(value);
+
+const httpError = (status, message) =>
+  Object.assign(new Error(message), { status });
+
+// Accepts either an uploaded image (data URL) or an image link (http/https),
+// sent in `image` or `imageUrl`. Returns { value } or { error }.
+function resolveImage(image, imageUrl) {
+  for (const v of [image, imageUrl]) {
+    if (v !== undefined && v !== null && typeof v !== "string") {
+      return { error: "Image must be a text value." };
+    }
+  }
+  const raw = [image, imageUrl].map((v) => (v ?? "").trim()).find(Boolean) ?? "";
+  if (!raw) return { value: null };
+  if (isImageDataUrl(raw) || isHttpUrl(raw)) return { value: raw };
+  return {
+    error:
+      "Image must be an http(s) link or a PNG, JPG, WEBP or GIF file.",
+  };
+}
+
+// Is this user the one who added the book?
+const isOwner = (book, user) =>
+  (Boolean(user.uid) && book.addedBy?.id === user.uid) ||
+  (Boolean(book.addedBy?.email) && book.addedBy.email === user.email);
+
+// Never expose other users' email addresses in API responses.
+function withoutEmail(book) {
+  if (!book.addedBy) return book;
+  const { email, ...addedBy } = book.addedBy;
+  return { ...book, addedBy };
+}
 
 // ---------- Middleware ----------
 // Token check: expects "Authorization: Bearer <ID token>".
@@ -83,7 +124,7 @@ async function verifyToken(req, res, next) {
 }
 
 function validId(req, res, next) {
-  if (!ObjectId.isValid(req.params.id)) {
+  if (!isObjectId(req.params.id)) {
     return res.status(400).send({ message: "Invalid id." });
   }
   next();
@@ -98,22 +139,25 @@ app.get("/", (req, res) => {
 // BOOKS
 // =====================================================
 
-// 1. GET /books — public
+// 1. GET /books — public (owner emails are hidden)
 app.get("/books", async (req, res, next) => {
   try {
-    const list = await books.find().sort({ createdAt: -1 }).toArray();
+    const list = await books
+      .find({}, { projection: { "addedBy.email": 0 } })
+      .sort({ createdAt: -1 })
+      .toArray();
     res.send(list);
   } catch (error) {
     next(error);
   }
 });
 
-// 2. GET /books/:id — protected
+// 2. GET /books/:id — protected (email only visible to the owner)
 app.get("/books/:id", verifyToken, validId, async (req, res, next) => {
   try {
     const book = await books.findOne({ _id: new ObjectId(req.params.id) });
     if (!book) return res.status(404).send({ message: "Book not found." });
-    res.send(book);
+    res.send(isOwner(book, req.user) ? book : withoutEmail(book));
   } catch (error) {
     next(error);
   }
@@ -123,9 +167,11 @@ app.get("/books/:id", verifyToken, validId, async (req, res, next) => {
 app.post("/books", verifyToken, async (req, res, next) => {
   try {
     const { title, author, category, copies, description, image, imageUrl } =
-      req.body;
+      req.body ?? {};
 
-    if (!title?.trim() || !author?.trim()) {
+    const cleanTitle = String(title ?? "").trim();
+    const cleanAuthor = String(author ?? "").trim();
+    if (!cleanTitle || !cleanAuthor) {
       return res
         .status(400)
         .send({ message: "Book title and author name are required." });
@@ -138,27 +184,17 @@ app.post("/books", verifyToken, async (req, res, next) => {
         .send({ message: "Total copies must be a whole number of at least 1." });
     }
 
-    if (image && !isImageDataUrl(String(image))) {
-      return res
-        .status(400)
-        .send({ message: "Image must be a PNG, JPG, WEBP or GIF file." });
-    }
-
-    const trimmedImageUrl = imageUrl?.trim();
-    if (trimmedImageUrl && !isHttpUrl(trimmedImageUrl)) {
-      return res
-        .status(400)
-        .send({ message: "Image URL must start with http:// or https://." });
-    }
+    const img = resolveImage(image, imageUrl);
+    if (img.error) return res.status(400).send({ message: img.error });
 
     const book = {
-      title: title.trim(),
-      author: author.trim(),
-      category: category || "Fiction",
-      description: description?.trim() || "",
+      title: cleanTitle,
+      author: cleanAuthor,
+      category: typeof category === "string" && category ? category : "Fiction",
+      description: String(description ?? "").trim(),
       totalCopies,
       availableCopies: totalCopies,
-      image: image || trimmedImageUrl || null,
+      image: img.value,
       addedBy: {
         id: req.user.uid,
         name: req.user.name,
@@ -176,15 +212,21 @@ app.post("/books", verifyToken, async (req, res, next) => {
   }
 });
 
-// 4. PATCH /books/:id — protected
+// 4. PATCH /books/:id — protected, owner only
 app.patch("/books/:id", verifyToken, validId, async (req, res, next) => {
   try {
     const _id = new ObjectId(req.params.id);
     const existing = await books.findOne({ _id });
     if (!existing) return res.status(404).send({ message: "Book not found." });
 
+    if (!isOwner(existing, req.user)) {
+      return res
+        .status(403)
+        .send({ message: "Forbidden: you can only edit books you added." });
+    }
+
     const { title, author, category, description, copies, image, imageUrl } =
-      req.body;
+      req.body ?? {};
     const update = {};
 
     if (title !== undefined) {
@@ -201,24 +243,20 @@ app.patch("/books/:id", verifyToken, validId, async (req, res, next) => {
       update.author = String(author).trim();
     }
 
-    if (category !== undefined) update.category = category;
+    if (category !== undefined) {
+      if (typeof category !== "string" || !category) {
+        return res.status(400).send({ message: "Invalid category." });
+      }
+      update.category = category;
+    }
+
     if (description !== undefined) update.description = String(description).trim();
 
-    if (image) {
-      if (!isImageDataUrl(String(image))) {
-        return res
-          .status(400)
-          .send({ message: "Image must be a PNG, JPG, WEBP or GIF file." });
-      }
-      update.image = image;
-    } else if (imageUrl !== undefined) {
-      const trimmed = String(imageUrl).trim();
-      if (trimmed && !isHttpUrl(trimmed)) {
-        return res
-          .status(400)
-          .send({ message: "Image URL must start with http:// or https://." });
-      }
-      if (trimmed) update.image = trimmed;
+    if (image !== undefined || imageUrl !== undefined) {
+      const img = resolveImage(image, imageUrl);
+      if (img.error) return res.status(400).send({ message: img.error });
+      // Empty value = keep the current image.
+      if (img.value) update.image = img.value;
     }
 
     if (copies !== undefined) {
@@ -254,14 +292,20 @@ app.patch("/books/:id", verifyToken, validId, async (req, res, next) => {
   }
 });
 
-// 5. DELETE /books/:id — protected
+// 5. DELETE /books/:id — protected, owner only
 app.delete("/books/:id", verifyToken, validId, async (req, res, next) => {
   try {
     const _id = new ObjectId(req.params.id);
-    const result = await books.deleteOne({ _id });
-    if (result.deletedCount === 0) {
-      return res.status(404).send({ message: "Book not found." });
+    const existing = await books.findOne({ _id });
+    if (!existing) return res.status(404).send({ message: "Book not found." });
+
+    if (!isOwner(existing, req.user)) {
+      return res
+        .status(403)
+        .send({ message: "Forbidden: you can only delete books you added." });
     }
+
+    await books.deleteOne({ _id });
     // Remove dangling borrow records for the deleted book.
     await borrows.deleteMany({ bookId: req.params.id });
     res.send({ message: "Book deleted successfully." });
@@ -277,8 +321,8 @@ app.delete("/books/:id", verifyToken, validId, async (req, res, next) => {
 // 6. POST /borrows — protected. Body: { bookId }
 app.post("/borrows", verifyToken, async (req, res, next) => {
   try {
-    const { bookId } = req.body;
-    if (!ObjectId.isValid(bookId)) {
+    const bookId = req.body?.bookId;
+    if (!isObjectId(bookId)) {
       return res.status(400).send({ message: "A valid bookId is required." });
     }
 
@@ -326,6 +370,10 @@ app.post("/borrows", verifyToken, async (req, res, next) => {
     } catch (err) {
       // Give the copy back if the borrow couldn't be saved.
       await books.updateOne({ _id: book._id }, { $inc: { availableCopies: 1 } });
+      // Unique index hit: two simultaneous requests for the same book.
+      if (err?.code === 11000) {
+        return next(httpError(409, "You have already borrowed this book."));
+      }
       throw err;
     }
   } catch (error) {
@@ -375,9 +423,14 @@ app.use((error, req, res, next) => {
     return res.status(413).send({ message: "The uploaded image is too large." });
   }
 
-  res
-    .status(error.status ?? 500)
-    .send({ message: error.message || "Something went wrong on the server." });
+  const status = error.status ?? 500;
+  res.status(status).send({
+    // Don't leak internal error details to clients.
+    message:
+      status >= 500
+        ? "Something went wrong on the server."
+        : error.message,
+  });
 });
 
 // ---------- Start ----------
@@ -385,6 +438,16 @@ async function start() {
   try {
     await client.connect();
     console.log("You successfully connected to MongoDB!");
+
+    // One borrow per user per book, enforced by the database.
+    try {
+      await borrows.createIndex({ bookId: 1, userEmail: 1 }, { unique: true });
+    } catch (indexError) {
+      console.warn(
+        "Could not create unique borrow index (duplicate records exist?):",
+        indexError.message,
+      );
+    }
 
     app.listen(PORT, () => {
       console.log(`Server is running at ${PORT}`);
@@ -396,3 +459,5 @@ async function start() {
 }
 
 start();
+
+export default app;
