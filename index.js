@@ -1,3 +1,15 @@
+/**
+ * BookHollow API
+ *
+ * Express server for the BookHollow library app.
+ * - Auth:     verifies Better Auth JWTs against the frontend's JWKS endpoint
+ * - Database: MongoDB (collections: books, borrows)
+ * - Routes:   /books (CRUD, owner-only edit/delete), /borrows (borrow/return)
+ *
+ * Required env: AUTH_URL, MONGODB_URI
+ * Optional env: MONGODB_DB (default "library"), PORT (default 8000)
+ */
+
 import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import cors from "cors";
